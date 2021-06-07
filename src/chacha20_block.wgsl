@@ -52,7 +52,7 @@ fn block_setup() {
     state.data[0] = 1634760805u;
     state.data[1] = 857760878u;
     state.data[2] = 2036477234u;
-    state.data[3] = 1797285235u;
+    state.data[3] = 1797285236u;
     state.data[4] = routine.key[0];
     state.data[5] = routine.key[1];
     state.data[6] = routine.key[2];

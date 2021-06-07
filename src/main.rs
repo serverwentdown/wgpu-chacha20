@@ -3,7 +3,44 @@ use std::borrow::Cow;
 use std::convert::TryInto;
 use wgpu::util::DeviceExt;
 
-async fn run() {}
+async fn run() {
+    let gpu = GPU::new().await;
+    let chacha_shader = gpu.create_shader(include_str!("chacha20_block.wgsl"));
+
+    let routine: Vec<u32> = vec![
+        0x03020100, 0x07060504, 0x0b0a0908, 0x0f0e0d0c, // 4-7
+        0x13121110, 0x17161514, 0x1b1a1918, 0x1f1e1d1c, // 8-11
+        0x00000001, 0x09000000, 0x4a000000, 0x00000000, // 12-15
+    ];
+    let buffer = gpu
+        .do_thing_with_state(
+            &chacha_shader,
+            bytemuck::cast_slice(&routine),
+            16 * 4,
+            (1, 1, 1),
+        )
+        .await
+        .unwrap();
+
+    let data = buffer.slice(..).get_mapped_range();
+    let result: Vec<u32> = data
+        .chunks_exact(4)
+        .map(|b| u32::from_ne_bytes(b.try_into().unwrap()))
+        .collect();
+
+    drop(data);
+    gpu.drop_buffer(buffer);
+
+    assert_eq!(
+        result,
+        vec![
+            0x837778ab, 0xe238d763, 0xa67ae21e, 0x5950bb2f, // 0-3
+            0xc4f2d0c7, 0xfc62bb2f, 0x8fa018fc, 0x3f5ec7b7, // 4-7
+            0x335271c2, 0xf29489f3, 0xeabda8fc, 0x82e46ebd, // 8-11
+            0xd19c12b4, 0xb04e16de, 0x9e83d0cb, 0x4e3c50a2, // 12-15
+        ]
+    )
+}
 
 struct GPU {
     device: wgpu::Device,
@@ -83,6 +120,104 @@ impl GPU {
             })
     }
 
+    async fn do_thing_with_state(
+        &self,
+        module: &wgpu::ShaderModule,
+        data: &[u8],
+        state_size: u32,
+        workgroups: (u32, u32, u32),
+    ) -> Result<wgpu::Buffer, wgpu::BufferAsyncError> {
+        let size = data.len() as wgpu::BufferAddress;
+
+        let staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: state_size as wgpu::BufferAddress,
+            usage: wgpu::BufferUsage::MAP_READ | wgpu::BufferUsage::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let storage_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Storage Buffer"),
+                contents: data,
+                usage: wgpu::BufferUsage::STORAGE
+                    | wgpu::BufferUsage::COPY_DST
+                    | wgpu::BufferUsage::COPY_SRC,
+            });
+
+        let state_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("State Buffer"),
+            size: state_size as wgpu::BufferAddress,
+            mapped_at_creation: false,
+            usage: wgpu::BufferUsage::STORAGE
+                | wgpu::BufferUsage::COPY_DST
+                | wgpu::BufferUsage::COPY_SRC,
+        });
+
+        let compute_pipeline =
+            self.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: None,
+                    layout: None,
+                    module,
+                    entry_point: "main",
+                });
+
+        let bind_group_layout = compute_pipeline.get_bind_group_layout(0);
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: storage_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: state_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut cpass =
+                encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
+            cpass.set_pipeline(&compute_pipeline);
+            cpass.set_bind_group(0, &bind_group, &[]);
+            cpass.insert_debug_marker("TODO");
+            let (x, y, z) = workgroups;
+            cpass.dispatch(x, y, z);
+        }
+        encoder.copy_buffer_to_buffer(
+            &state_buffer,
+            0,
+            &staging_buffer,
+            0,
+            state_size as wgpu::BufferAddress,
+        );
+
+        debug!("submit");
+        self.queue.submit(Some(encoder.finish()));
+
+        debug!("slice");
+        let buffer_slice = staging_buffer.slice(..); // What's this for?
+        debug!("slice future");
+        let buffer_future = buffer_slice.map_async(wgpu::MapMode::Read);
+
+        debug!("poll");
+        self.device.poll(wgpu::Maintain::Wait);
+
+        debug!("slice future wait");
+        buffer_future.await?;
+        debug!("done");
+
+        Ok(staging_buffer)
+    }
+
     async fn do_thing(
         &self,
         module: &wgpu::ShaderModule,
@@ -121,16 +256,10 @@ impl GPU {
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: storage_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: storage_buffer.as_entire_binding(),
-                },
-            ],
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: storage_buffer.as_entire_binding(),
+            }],
         });
 
         let mut encoder = self
@@ -230,17 +359,23 @@ mod tests {
     }
 
     async fn async_block() {
+        std::env::set_var("RUST_LOG", "debug");
+
         let gpu = GPU::new().await;
         let chacha_shader = gpu.create_shader(include_str!("chacha20_block.wgsl"));
 
         let routine: Vec<u32> = vec![
-            0x0, 0x0, 0x0, 0x0, // 0-3
             0x03020100, 0x07060504, 0x0b0a0908, 0x0f0e0d0c, // 4-7
             0x13121110, 0x17161514, 0x1b1a1918, 0x1f1e1d1c, // 8-11
             0x00000001, 0x09000000, 0x4a000000, 0x00000000, // 12-15
         ];
         let buffer = gpu
-            .do_thing(&chacha_shader, bytemuck::cast_slice(&routine), (1, 1, 1))
+            .do_thing_with_state(
+                &chacha_shader,
+                bytemuck::cast_slice(&routine),
+                16 * 4,
+                (1, 1, 1),
+            )
             .await
             .unwrap();
 
