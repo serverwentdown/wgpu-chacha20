@@ -1,205 +1,172 @@
-use std::{borrow::Cow, convert::TryInto, str::FromStr};
+use log::debug;
+use std::borrow::Cow;
+use std::convert::TryInto;
 use wgpu::util::DeviceExt;
 
-// Indicates a u32 overflow in an intermediate Collatz value
-const OVERFLOW: u32 = 0xffffffff;
+async fn run() {}
 
-async fn run() {
-    let numbers = if std::env::args().len() <= 1 {
-        let default = vec![1, 2, 3, 4];
-        println!("No numbers were provided, defaulting to {:?}", default);
-        default
-    } else {
-        std::env::args()
-            .skip(1)
-            .map(|s| u32::from_str(&s).expect("You must pass a list of positive integers!"))
-            .collect()
-    };
-
-    let steps = execute_gpu(numbers).await;
-
-    let disp_steps: Vec<String> = steps
-        .iter()
-        .map(|&n| match n {
-            OVERFLOW => "OVERFLOW".to_string(),
-            _ => n.to_string(),
-        })
-        .collect();
-
-    println!("Steps: [{}]", disp_steps.join(", "));
-    #[cfg(target_arch = "wasm32")]
-    log::info!("Steps: [{}]", disp_steps.join(", "));
+struct GPU {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    adapter: wgpu::Adapter,
 }
 
-async fn execute_gpu(numbers: Vec<u32>) -> Vec<u32> {
-    let backend = if let Ok(backend) = std::env::var("WGPU_BACKEND") {
-        match backend.to_lowercase().as_str() {
-            "vulkan" => wgpu::BackendBit::VULKAN,
-            "metal" => wgpu::BackendBit::METAL,
-            "dx12" => wgpu::BackendBit::DX12,
-            "dx11" => wgpu::BackendBit::DX11,
-            "gl" => wgpu::BackendBit::GL,
-            "webgpu" => wgpu::BackendBit::BROWSER_WEBGPU,
-            other => panic!("Unknown backend: {}", other),
+impl GPU {
+    async fn new() -> GPU {
+        let backend = if let Ok(backend) = std::env::var("WGPU_BACKEND") {
+            match backend.to_lowercase().as_str() {
+                "vulkan" => wgpu::BackendBit::VULKAN,
+                "metal" => wgpu::BackendBit::METAL,
+                "dx12" => wgpu::BackendBit::DX12,
+                "dx11" => wgpu::BackendBit::DX11,
+                "gl" => wgpu::BackendBit::GL,
+                "webgpu" => wgpu::BackendBit::BROWSER_WEBGPU,
+                other => panic!("Unknown backend: {}", other),
+            }
+        } else {
+            wgpu::BackendBit::PRIMARY
+        };
+
+        let power_preference = if let Ok(power_preference) = std::env::var("WGPU_POWER_PREF") {
+            match power_preference.to_lowercase().as_str() {
+                "low" => wgpu::PowerPreference::LowPower,
+                "high" => wgpu::PowerPreference::HighPerformance,
+                other => panic!("Unknown power preference: {}", other),
+            }
+        } else {
+            wgpu::PowerPreference::default()
+        };
+
+        let instance = wgpu::Instance::new(backend);
+
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference,
+                compatible_surface: None,
+            })
+            .await
+            .unwrap();
+
+        let (device, queue) = adapter
+            .request_device(
+                &wgpu::DeviceDescriptor {
+                    label: None,
+                    features: wgpu::Features::empty(),
+                    limits: wgpu::Limits::default(),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+
+        GPU {
+            device,
+            queue,
+            adapter,
         }
-    } else {
-        wgpu::BackendBit::PRIMARY
-    };
+    }
 
-    let power_preference = if let Ok(power_preference) = std::env::var("WGPU_POWER_PREF") {
-        match power_preference.to_lowercase().as_str() {
-            "low" => wgpu::PowerPreference::LowPower,
-            "high" => wgpu::PowerPreference::HighPerformance,
-            other => panic!("Unknown power preference: {}", other),
+    fn create_shader(&self, source: &str) -> wgpu::ShaderModule {
+        let mut flags = wgpu::ShaderFlags::VALIDATION;
+        match self.adapter.get_info().backend {
+            wgpu::Backend::Vulkan | wgpu::Backend::Metal | wgpu::Backend::Gl => {
+                flags |= wgpu::ShaderFlags::EXPERIMENTAL_TRANSLATION;
+            }
+            _ => {}
         }
-    } else {
-        wgpu::PowerPreference::default()
-    };
 
-    // Instantiates instance of WebGPU
-    let instance = wgpu::Instance::new(backend);
-
-    // `request_adapter` instantiates the general connection to the GPU
-    let adapter = instance
-        .request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference,
-            compatible_surface: None,
-        })
-        .await
-        .unwrap();
-
-    // `request_device` instantiates the feature specific connection to the GPU, defining some parameters,
-    //  `features` being the available features.
-    let (device, queue) = adapter
-        .request_device(
-            &wgpu::DeviceDescriptor {
+        self.device
+            .create_shader_module(&wgpu::ShaderModuleDescriptor {
                 label: None,
-                features: wgpu::Features::empty(),
-                limits: wgpu::Limits::default(),
-            },
-            None,
-        )
-        .await
-        .unwrap();
+                source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(source)),
+                flags,
+            })
+    }
 
-    // Loads the shader from the SPIR-V file.arrayvec
-    let mut flags = wgpu::ShaderFlags::VALIDATION;
-    match adapter.get_info().backend {
-        wgpu::Backend::Vulkan | wgpu::Backend::Metal | wgpu::Backend::Gl => {
-            flags |= wgpu::ShaderFlags::EXPERIMENTAL_TRANSLATION;
+    async fn do_thing(
+        &self,
+        module: &wgpu::ShaderModule,
+        data: &[u8],
+        workgroups: (u32, u32, u32),
+    ) -> Result<wgpu::Buffer, wgpu::BufferAsyncError> {
+        let size = data.len() as wgpu::BufferAddress;
+
+        let staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size,
+            usage: wgpu::BufferUsage::MAP_READ | wgpu::BufferUsage::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let storage_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Storage Buffer"),
+                contents: data,
+                usage: wgpu::BufferUsage::STORAGE
+                    | wgpu::BufferUsage::COPY_DST
+                    | wgpu::BufferUsage::COPY_SRC,
+            });
+
+        let compute_pipeline =
+            self.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: None,
+                    layout: None,
+                    module,
+                    entry_point: "main",
+                });
+
+        let bind_group_layout = compute_pipeline.get_bind_group_layout(0);
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: storage_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: storage_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut cpass =
+                encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
+            cpass.set_pipeline(&compute_pipeline);
+            cpass.set_bind_group(0, &bind_group, &[]);
+            cpass.insert_debug_marker("TODO");
+            let (x, y, z) = workgroups;
+            cpass.dispatch(x, y, z);
         }
-        _ => {}
+        encoder.copy_buffer_to_buffer(&storage_buffer, 0, &staging_buffer, 0, size);
+
+        debug!("submit");
+        self.queue.submit(Some(encoder.finish()));
+
+        debug!("slice");
+        let buffer_slice = staging_buffer.slice(..); // What's this for?
+        debug!("slice future");
+        let buffer_future = buffer_slice.map_async(wgpu::MapMode::Read);
+
+        debug!("poll");
+        self.device.poll(wgpu::Maintain::Wait);
+
+        debug!("slice future wait");
+        buffer_future.await?;
+        debug!("done");
+
+        Ok(staging_buffer)
     }
-    let cs_module = device.create_shader_module(&wgpu::ShaderModuleDescriptor {
-        label: None,
-        source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("shader.wgsl"))),
-        flags,
-    });
 
-    // Gets the size in bytes of the buffer.
-    let slice_size = numbers.len() * std::mem::size_of::<u32>();
-    let size = slice_size as wgpu::BufferAddress;
-
-    // Instantiates buffer without data.
-    // `usage` of buffer specifies how it can be used:
-    //   `BufferUsage::MAP_READ` allows it to be read (outside the shader).
-    //   `BufferUsage::COPY_DST` allows it to be the destination of the copy.
-    let staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: None,
-        size,
-        usage: wgpu::BufferUsage::MAP_READ | wgpu::BufferUsage::COPY_DST,
-        mapped_at_creation: false,
-    });
-
-    // Instantiates buffer with data (`numbers`).
-    // Usage allowing the buffer to be:
-    //   A storage buffer (can be bound within a bind group and thus available to a shader).
-    //   The destination of a copy.
-    //   The source of a copy.
-    let storage_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("Storage Buffer"),
-        contents: bytemuck::cast_slice(&numbers),
-        usage: wgpu::BufferUsage::STORAGE
-            | wgpu::BufferUsage::COPY_DST
-            | wgpu::BufferUsage::COPY_SRC,
-    });
-
-    // A bind group defines how buffers are accessed by shaders.
-    // It is to WebGPU what a descriptor set is to Vulkan.
-    // `binding` here refers to the `binding` of a buffer in the shader (`layout(set = 0, binding = 0) buffer`).
-
-    // A pipeline specifies the operation of a shader
-
-    // Instantiates the pipeline.
-    let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: None,
-        layout: None,
-        module: &cs_module,
-        entry_point: "main",
-    });
-
-    // Instantiates the bind group, once again specifying the binding of buffers.
-    let bind_group_layout = compute_pipeline.get_bind_group_layout(0);
-    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: None,
-        layout: &bind_group_layout,
-        entries: &[wgpu::BindGroupEntry {
-            binding: 0,
-            resource: storage_buffer.as_entire_binding(),
-        }],
-    });
-
-    // A command encoder executes one or many pipelines.
-    // It is to WebGPU what a command buffer is to Vulkan.
-    let mut encoder =
-        device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-    {
-        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
-        cpass.set_pipeline(&compute_pipeline);
-        cpass.set_bind_group(0, &bind_group, &[]);
-        cpass.insert_debug_marker("compute collatz iterations");
-        cpass.dispatch(numbers.len() as u32, 1, 1); // Number of cells to run, the (x,y,z) size of item being processed
-    }
-    // Sets adds copy operation to command encoder.
-    // Will copy data from storage buffer on GPU to staging buffer on CPU.
-    encoder.copy_buffer_to_buffer(&storage_buffer, 0, &staging_buffer, 0, size);
-
-    // Submits command encoder for processing
-    queue.submit(Some(encoder.finish()));
-
-    // Note that we're not calling `.await` here.
-    let buffer_slice = staging_buffer.slice(..);
-    // Gets the future representing when `staging_buffer` can be read from
-    let buffer_future = buffer_slice.map_async(wgpu::MapMode::Read);
-
-    // Poll the device in a blocking manner so that our future resolves.
-    // In an actual application, `device.poll(...)` should
-    // be called in an event loop or on another thread.
-    device.poll(wgpu::Maintain::Wait);
-
-    // Awaits until `buffer_future` can be read from
-    if let Ok(()) = buffer_future.await {
-        // Gets contents of buffer
-        let data = buffer_slice.get_mapped_range();
-        // Since contents are got in bytes, this converts these bytes back to u32
-        let result = data
-            .chunks_exact(4)
-            .map(|b| u32::from_ne_bytes(b.try_into().unwrap()))
-            .collect();
-
-        // With the current interface, we have to make sure all mapped views are
-        // dropped before we unmap the buffer.
-        drop(data);
-        staging_buffer.unmap(); // Unmaps buffer from memory
-                                // If you are familiar with C++ these 2 lines can be thought of similarly to:
-                                //   delete myPointer;
-                                //   myPointer = NULL;
-                                // It effectively frees the memory
-
-        // Returns data from buffer
-        result
-    } else {
-        panic!("failed to run compute on gpu!")
+    fn drop_buffer(&self, buffer: wgpu::Buffer) {
+        buffer.unmap();
     }
 }
 
@@ -217,54 +184,88 @@ fn main() {
     }
 }
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_compute_1() {
-        let input = vec![1, 2, 3, 4];
-        pollster::block_on(assert_execute_gpu(input, vec![0, 1, 7, 2]));
+    async fn async_qround() {
+        let gpu = GPU::new().await;
+        let chacha_shader = gpu.create_shader(include_str!("chacha20_qround.wgsl"));
+
+        let state: Vec<u32> = vec![
+            0x879531e0, 0xc5ecf37d, 0x516461b1, 0xc9a62f8a, // 0-3
+            0x44c20ef3, 0x3390af7f, 0xd9fc690b, 0x2a5f714c, // 4-7
+            0x53372767, 0xb00a5631, 0x974c541a, 0x359e9963, // 8-11
+            0x5c971061, 0x3d631689, 0x2098d9d6, 0x91dbd320, // 12-15
+        ];
+
+        let buffer = gpu
+            .do_thing(&chacha_shader, bytemuck::cast_slice(&state), (1, 1, 1))
+            .await
+            .unwrap();
+
+        let data = buffer.slice(..).get_mapped_range();
+        let result: Vec<u32> = data
+            .chunks_exact(4)
+            .map(|b| u32::from_ne_bytes(b.try_into().unwrap()))
+            .collect();
+
+        drop(data);
+        gpu.drop_buffer(buffer);
+
+        assert_eq!(
+            result,
+            vec![
+                0x879531e0, 0xc5ecf37d, 0xbdb886dc, 0xc9a62f8a, // 0-3
+                0x44c20ef3, 0x3390af7f, 0xd9fc690b, 0xcfacafd2, // 4-7
+                0xe46bea80, 0xb00a5631, 0x974c541a, 0x359e9963, // 8-11
+                0x5c971061, 0xccc07c79, 0x2098d9d6, 0x91dbd320, // 12-15
+            ]
+        )
     }
 
     #[test]
-    fn test_compute_2() {
-        let input = vec![5, 23, 10, 9];
-        pollster::block_on(assert_execute_gpu(input, vec![5, 15, 6, 19]));
+    fn qround() {
+        pollster::block_on(async_qround());
+    }
+
+    async fn async_block() {
+        let gpu = GPU::new().await;
+        let chacha_shader = gpu.create_shader(include_str!("chacha20_block.wgsl"));
+
+        let routine: Vec<u32> = vec![
+            0x0, 0x0, 0x0, 0x0, // 0-3
+            0x03020100, 0x07060504, 0x0b0a0908, 0x0f0e0d0c, // 4-7
+            0x13121110, 0x17161514, 0x1b1a1918, 0x1f1e1d1c, // 8-11
+            0x00000001, 0x09000000, 0x4a000000, 0x00000000, // 12-15
+        ];
+        let buffer = gpu
+            .do_thing(&chacha_shader, bytemuck::cast_slice(&routine), (1, 1, 1))
+            .await
+            .unwrap();
+
+        let data = buffer.slice(..).get_mapped_range();
+        let result: Vec<u32> = data
+            .chunks_exact(4)
+            .map(|b| u32::from_ne_bytes(b.try_into().unwrap()))
+            .collect();
+
+        drop(data);
+        gpu.drop_buffer(buffer);
+
+        assert_eq!(
+            result,
+            vec![
+                0x837778ab, 0xe238d763, 0xa67ae21e, 0x5950bb2f, // 0-3
+                0xc4f2d0c7, 0xfc62bb2f, 0x8fa018fc, 0x3f5ec7b7, // 4-7
+                0x335271c2, 0xf29489f3, 0xeabda8fc, 0x82e46ebd, // 8-11
+                0xd19c12b4, 0xb04e16de, 0x9e83d0cb, 0x4e3c50a2, // 12-15
+            ]
+        )
     }
 
     #[test]
-    fn test_compute_overflow() {
-        let input = vec![77031, 837799, 8400511, 63728127];
-        pollster::block_on(assert_execute_gpu(
-            input,
-            vec![350, 524, OVERFLOW, OVERFLOW],
-        ));
-    }
-
-    #[test]
-    fn test_multithreaded_compute() {
-        use std::{sync::mpsc, thread, time::Duration};
-
-        let thread_count = 8;
-
-        let (tx, rx) = mpsc::channel();
-        for _ in 0..thread_count {
-            let tx = tx.clone();
-            thread::spawn(move || {
-                let input = vec![100, 100, 100];
-                pollster::block_on(assert_execute_gpu(input, vec![25, 25, 25]));
-                tx.send(true).unwrap();
-            });
-        }
-
-        for _ in 0..thread_count {
-            rx.recv_timeout(Duration::from_secs(10))
-                .expect("A thread never completed.");
-        }
-    }
-
-    async fn assert_execute_gpu(input: Vec<u32>, expected: Vec<u32>) {
-        assert_eq!(execute_gpu(input).await, expected);
+    fn block() {
+        pollster::block_on(async_block());
     }
 }
