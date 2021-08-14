@@ -77,7 +77,23 @@ fn block() {
         i = i + 1u;
     }
     
-    // TODO: state + original_state
+    // TODO: replace with matrix addition
+    state.data[0] = state.data[0] + 1634760805u;
+    state.data[1] = state.data[1] + 857760878u;
+    state.data[2] = state.data[2] + 2036477234u;
+    state.data[3] = state.data[3] + 1797285236u;
+    state.data[4] = state.data[4] + routine.key[0];
+    state.data[5] = state.data[5] + routine.key[1];
+    state.data[6] = state.data[6] + routine.key[2];
+    state.data[7] = state.data[7] + routine.key[3];
+    state.data[8] = state.data[8] + routine.key[4];
+    state.data[9] = state.data[9] + routine.key[5];
+    state.data[10] = state.data[10] + routine.key[6];
+    state.data[11] = state.data[11] + routine.key[7];
+    state.data[12] = state.data[12] + routine.start_counter;
+    state.data[13] = state.data[13] + routine.nonce[0];
+    state.data[14] = state.data[14] + routine.nonce[1];
+    state.data[15] = state.data[15] + routine.nonce[2];
 }
 
 [[stage(compute), workgroup_size(1)]]

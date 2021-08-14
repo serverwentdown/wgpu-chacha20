@@ -34,10 +34,14 @@ async fn run() {
     assert_eq!(
         result,
         vec![
-            0x837778ab, 0xe238d763, 0xa67ae21e, 0x5950bb2f, // 0-3
-            0xc4f2d0c7, 0xfc62bb2f, 0x8fa018fc, 0x3f5ec7b7, // 4-7
-            0x335271c2, 0xf29489f3, 0xeabda8fc, 0x82e46ebd, // 8-11
-            0xd19c12b4, 0xb04e16de, 0x9e83d0cb, 0x4e3c50a2, // 12-15
+            //0x837778ab, 0xe238d763, 0xa67ae21e, 0x5950bb2f, // 0-3
+            //0xc4f2d0c7, 0xfc62bb2f, 0x8fa018fc, 0x3f5ec7b7, // 4-7
+            //0x335271c2, 0xf29489f3, 0xeabda8fc, 0x82e46ebd, // 8-11
+            //0xd19c12b4, 0xb04e16de, 0x9e83d0cb, 0x4e3c50a2, // 12-15
+            0xe4e7f110, 0x15593bd1, 0x1fdd0f50, 0xc47120a3, // 0-3
+            0xc7f4d1c7, 0x0368c033, 0x9aaa2204, 0x4e6cd4c3, // 4-7
+            0x466482d2, 0x09aa9f07, 0x05d7c214, 0xa2028bd9, // 8-11
+            0xd19c12b5, 0xb94e16de, 0xe883d0cb, 0x4e3c50a2, // 12-15
         ]
     )
 }
@@ -391,10 +395,10 @@ mod tests {
         assert_eq!(
             result,
             vec![
-                0x837778ab, 0xe238d763, 0xa67ae21e, 0x5950bb2f, // 0-3
-                0xc4f2d0c7, 0xfc62bb2f, 0x8fa018fc, 0x3f5ec7b7, // 4-7
-                0x335271c2, 0xf29489f3, 0xeabda8fc, 0x82e46ebd, // 8-11
-                0xd19c12b4, 0xb04e16de, 0x9e83d0cb, 0x4e3c50a2, // 12-15
+                0xe4e7f110, 0x15593bd1, 0x1fdd0f50, 0xc47120a3, // 0-3
+                0xc7f4d1c7, 0x0368c033, 0x9aaa2204, 0x4e6cd4c3, // 4-7
+                0x466482d2, 0x09aa9f07, 0x05d7c214, 0xa2028bd9, // 8-11
+                0xd19c12b5, 0xb94e16de, 0xe883d0cb, 0x4e3c50a2, // 12-15
             ]
         )
     }
